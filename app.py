@@ -131,6 +131,51 @@ def tg_send(text, chat_id=None):
             return False
     return True
 
+TG_PHOTO_MAX = 10 * 1024 * 1024   # sendPhoto limit
+TG_DOC_MAX = 50 * 1024 * 1024     # sendDocument limit (bots)
+
+
+def tg_send_media(kind, chat_id, filename, ctype, data, caption=None):
+    """Send one photo/document to a Telegram chat via multipart upload."""
+    chat_id = str(chat_id or TELEGRAM_CHAT_ID)
+    field = "photo" if kind == "photo" else "document"
+    method = "sendPhoto" if kind == "photo" else "sendDocument"
+    payload = {"chat_id": chat_id}
+    if caption:
+        payload["caption"] = caption[:1024]
+    try:
+        r = requests.post(f"{TG_API}/{method}", data=payload,
+                          files={field: (filename, data, ctype)}, timeout=60)
+    except Exception as e:
+        log.error("telegram %s failed: %s", method, e)
+        return False
+    if not r.ok:
+        log.error("telegram %s failed: %s %s", method, r.status_code, r.text[:200])
+        return False
+    return True
+
+
+def forward_attachments(atts, chat_id, caption=None):
+    """Send extracted attachments to Telegram; returns note lines for failures."""
+    caption_left = caption[:1024] if caption else None
+    notes = []
+    for filename, ctype, data in atts:
+        is_image = ctype.startswith("image/")
+        if is_image and len(data) <= TG_PHOTO_MAX:
+            kind = "photo"
+        elif len(data) <= TG_DOC_MAX:
+            kind = "document"  # oversized images ride as documents
+        else:
+            mb = round(len(data) / (1024 * 1024), 1)
+            notes.append(f"\U0001F4CE {filename} - הקובץ גדול מדי להעברה לטלגרם ({mb}MB)")
+            continue
+        if tg_send_media(kind, chat_id, filename, ctype, data, caption=caption_left):
+            caption_left = None
+        else:
+            notes.append(f"\U0001F4CE {filename} ({ctype}) - ההעברה לטלגרם נכשלה")
+    return notes
+
+
 # ---------------- email: send ----------------
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -246,6 +291,25 @@ def _extract_text(msg):
         return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+", " ", text)).strip()
     return ""
 
+def _extract_attachments(msg):
+    """Return [(filename, content_type, bytes)] for real attachments (inline skipped)."""
+    out = []
+    if not msg.is_multipart():
+        return out
+    for part in msg.walk():
+        if part.get_content_disposition() != "attachment":
+            continue
+        filename = _decode(part.get_filename()) or "attachment"
+        try:
+            data = part.get_content()
+            if isinstance(data, str):
+                data = data.encode("utf-8", errors="replace")
+        except Exception:
+            data = part.get_payload(decode=True) or b""
+        out.append((filename, part.get_content_type() or "application/octet-stream", data))
+    return out
+
+
 def _imap_connect():
     conn = imaplib.IMAP4_SSL("imap.gmail.com", 993)
     conn.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
@@ -279,9 +343,21 @@ def poll_agent_replies():
                             subject = _decode(msg.get("Subject"))
                             base_subject = re.sub(r"^(Re:\s*)+", "", subject).strip()
                             target_chat = chat_for_subject(base_subject)
-                            if body and target_chat:
-                                tg_send(body, chat_id=target_chat)
-                            elif body:
+                            atts = _extract_attachments(msg)
+                            if target_chat and (body or atts):
+                                notes = []
+                                if atts:
+                                    if body and len(body) <= 1024:
+                                        notes = forward_attachments(atts, target_chat, caption=body)
+                                    else:
+                                        if body:
+                                            tg_send(body, chat_id=target_chat)
+                                        notes = forward_attachments(atts, target_chat)
+                                elif body:
+                                    tg_send(body, chat_id=target_chat)
+                                if notes:
+                                    tg_send("\n".join(notes), chat_id=target_chat)
+                            elif body or atts:
                                 log.info("no target chat for subject %r, dropped", subject)
                             mid = msg.get("Message-ID")
                             if mid:
