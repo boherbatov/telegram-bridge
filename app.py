@@ -329,6 +329,14 @@ def selftest():
             except Exception as e:
                 errs.append(f"{attempt}: {e!r}")
         else:
+            probes = {}
+            for host, port in (("smtp.gmail.com",587),("smtp.gmail.com",465),("gmail.googleapis.com",443),("google.com",443),("imap.gmail.com",993)):
+                try:
+                    with _socket.create_connection((host,port),timeout=8):
+                        probes[f"{host}:{port}"]="tcp-ok"
+                except Exception as e:
+                    probes[f"{host}:{port}"]=f"{type(e).__name__}"
+            result["tcp"]=probes
             raise RuntimeError("; ".join(errs))
     except Exception as e:
         result["smtp"] = f"fail: {type(e).__name__}: {e}"
