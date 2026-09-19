@@ -14,6 +14,15 @@ All configuration comes from environment variables (see README.md).
 import imaplib
 import json
 import logging
+import socket as _socket
+
+# Render free tier has no outbound IPv6; Gmail sometimes resolves to IPv6
+# (Errno 101 Network is unreachable). Force IPv4 for all outbound sockets.
+_orig_getaddrinfo = _socket.getaddrinfo
+def _ipv4_getaddrinfo(*a, **kw):
+    return [r for r in _orig_getaddrinfo(*a, **kw) if r[0] == _socket.AF_INET]
+_socket.getaddrinfo = _ipv4_getaddrinfo
+
 import os
 import re
 import smtplib
