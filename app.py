@@ -27,6 +27,9 @@ import os
 import re
 import smtplib
 import threading
+import base64
+import urllib.request
+import urllib.parse
 import time
 from email import policy
 from email.header import decode_header, make_header
@@ -130,6 +133,32 @@ def tg_send(text, chat_id=None):
 
 # ---------------- email: send ----------------
 
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+
+
+def gmail_api_send(msg):
+    """Send via Gmail API over HTTPS (Render free blocks outbound SMTP ports)."""
+    data = urllib.parse.urlencode({
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "refresh_token": GOOGLE_REFRESH_TOKEN,
+        "grant_type": "refresh_token",
+    }).encode()
+    with urllib.request.urlopen(urllib.request.Request(
+            "https://oauth2.googleapis.com/token", data=data), timeout=20) as r:
+        access_token = json.loads(r.read())["access_token"]
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    req = urllib.request.Request(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+        data=json.dumps({"raw": raw}).encode(),
+        headers={"Authorization": "Bearer " + access_token,
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())
+
+
 def send_email_to_agent(body_text, chat_id, sender_label):
     subject = subject_for_chat(chat_id)
     references = thread_refs(subject)
@@ -151,6 +180,9 @@ def send_email_to_agent(body_text, chat_id, sender_label):
         msg["References"] = " ".join(references[-10:])
     msg.set_content(body)
 
+    if GOOGLE_REFRESH_TOKEN:
+        gmail_api_send(msg)
+        return True
     last_err = None
     for attempt in ("starttls", "ssl"):
         try:
@@ -313,6 +345,18 @@ def selftest():
         result["imap"] = f"fail: {type(e).__name__}: {e}"
 
     try:
+        if GOOGLE_REFRESH_TOKEN:
+            data = urllib.parse.urlencode({
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": GOOGLE_REFRESH_TOKEN,
+                "grant_type": "refresh_token",
+            }).encode()
+            with urllib.request.urlopen(urllib.request.Request(
+                    "https://oauth2.googleapis.com/token", data=data), timeout=15) as r:
+                json.loads(r.read())["access_token"]
+            result["smtp"] = "ok (gmail-api)"
+            return result
         errs = []
         for attempt in ("starttls", "ssl"):
             try:
