@@ -356,32 +356,32 @@ def selftest():
                     "https://oauth2.googleapis.com/token", data=data), timeout=15) as r:
                 json.loads(r.read())["access_token"]
             result["smtp"] = "ok (gmail-api)"
-            return result
-        errs = []
-        for attempt in ("starttls", "ssl"):
-            try:
-                if attempt == "starttls":
-                    with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as smtp:
-                        smtp.ehlo()
-                        smtp.starttls()
-                        smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-                else:
-                    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
-                        smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-                result["smtp"] = "ok"
-                break
-            except Exception as e:
-                errs.append(f"{attempt}: {e!r}")
         else:
-            probes = {}
-            for host, port in (("smtp.gmail.com",587),("smtp.gmail.com",465),("gmail.googleapis.com",443),("google.com",443),("imap.gmail.com",993)):
+            errs = []
+            for attempt in ("starttls", "ssl"):
                 try:
-                    with _socket.create_connection((host,port),timeout=8):
-                        probes[f"{host}:{port}"]="tcp-ok"
+                    if attempt == "starttls":
+                        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as smtp:
+                            smtp.ehlo()
+                            smtp.starttls()
+                            smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+                    else:
+                        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
+                            smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+                    result["smtp"] = "ok"
+                    break
                 except Exception as e:
-                    probes[f"{host}:{port}"]=f"{type(e).__name__}"
-            result["tcp"]=probes
-            raise RuntimeError("; ".join(errs))
+                    errs.append(f"{attempt}: {e!r}")
+            else:
+                probes = {}
+                for host, port in (("smtp.gmail.com",587),("smtp.gmail.com",465),("gmail.googleapis.com",443),("google.com",443),("imap.gmail.com",993)):
+                    try:
+                        with _socket.create_connection((host,port),timeout=8):
+                            probes[f"{host}:{port}"]="tcp-ok"
+                    except Exception as e:
+                        probes[f"{host}:{port}"]=f"{type(e).__name__}"
+                result["tcp"]=probes
+                raise RuntimeError("; ".join(errs))
     except Exception as e:
         result["smtp"] = f"fail: {type(e).__name__}: {e}"
 
