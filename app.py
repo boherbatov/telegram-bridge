@@ -392,7 +392,7 @@ def selftest():
     except Exception as e:
         result["telegram"] = f"fail: {type(e).__name__}: {e}"
 
-    healthy = all(v == "ok" for v in result.values())
+    healthy = all(str(v).startswith("ok") for v in result.values())
     return jsonify(result), (200 if healthy else 500)
 
 @app.get("/set-webhook")
