@@ -151,11 +151,26 @@ def send_email_to_agent(body_text, chat_id, sender_label):
         msg["References"] = " ".join(references[-10:])
     msg.set_content(body)
 
-    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
-        smtp.ehlo()
-        smtp.starttls()
-        smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        smtp.send_message(msg)
+    last_err = None
+    for attempt in ("starttls", "ssl"):
+        try:
+            if attempt == "starttls":
+                with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as smtp:
+                    smtp.ehlo()
+                    smtp.starttls()
+                    smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+                    smtp.send_message(msg)
+            else:
+                with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as smtp:
+                    smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+                    smtp.send_message(msg)
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            log.warning("smtp %s attempt failed: %r", attempt, e)
+    if last_err is not None:
+        raise last_err
 
     add_thread_ref(subject, msg_id)
     log.info("sent email to agent (chat %s, %d chars)", chat_id, len(body_text))
@@ -298,11 +313,23 @@ def selftest():
         result["imap"] = f"fail: {type(e).__name__}: {e}"
 
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
-            smtp.ehlo()
-            smtp.starttls()
-            smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        result["smtp"] = "ok"
+        errs = []
+        for attempt in ("starttls", "ssl"):
+            try:
+                if attempt == "starttls":
+                    with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as smtp:
+                        smtp.ehlo()
+                        smtp.starttls()
+                        smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+                else:
+                    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
+                        smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+                result["smtp"] = "ok"
+                break
+            except Exception as e:
+                errs.append(f"{attempt}: {e!r}")
+        else:
+            raise RuntimeError("; ".join(errs))
     except Exception as e:
         result["smtp"] = f"fail: {type(e).__name__}: {e}"
 
