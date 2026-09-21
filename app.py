@@ -53,7 +53,7 @@ GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"].replace(" ", "")
 AGENT_EMAIL = os.environ.get("AGENT_EMAIL", "arielgolan@mail.instinct.com")
 TRUST_MARKER = os.environ.get("TRUST_MARKER", "")  # required for owner trust; unset = owner forwards untrusted (fail-safe)
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))  # seconds
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "15"))  # seconds
 STATE_FILE = os.environ.get("STATE_FILE", "bridge_state.json")
 SUBJECT = os.environ.get("SUBJECT", "Telegram Bridge")
 
@@ -176,6 +176,63 @@ def forward_attachments(atts, chat_id, caption=None):
     return notes
 
 
+TG_FILE_MAX = 20 * 1024 * 1024  # Bot API getFile download limit
+
+
+def tg_file_info(file_id):
+    r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=20)
+    j = r.json()
+    if not j.get("ok"):
+        raise RuntimeError(f"getFile failed: {j}")
+    return j["result"]
+
+
+def tg_download_file(file_path):
+    url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+    with urllib.request.urlopen(url, timeout=120) as r:
+        return r.read()
+
+
+def extract_media(message):
+    """Return (filename, content_type, bytes) for one inbound media message, or None."""
+    kind, file_id, file_name, ctype, fsize = None, None, None, None, None
+    if message.get("photo"):
+        p = message["photo"][-1]  # largest size
+        kind, file_id, file_name, ctype = "photo", p["file_id"], "photo.jpg", "image/jpeg"
+        fsize = p.get("file_size")
+    elif message.get("document"):
+        d = message["document"]
+        kind, file_id = "document", d["file_id"]
+        file_name = d.get("file_name") or "document"
+        ctype = d.get("mime_type") or "application/octet-stream"
+        fsize = d.get("file_size")
+    elif message.get("video"):
+        v = message["video"]
+        kind, file_id, file_name, ctype = "video", v["file_id"], v.get("file_name") or "video.mp4", v.get("mime_type") or "video/mp4"
+        fsize = v.get("file_size")
+    elif message.get("audio"):
+        a = message["audio"]
+        kind, file_id, file_name, ctype = "audio", a["file_id"], a.get("file_name") or "audio.mp3", a.get("mime_type") or "audio/mpeg"
+        fsize = a.get("file_size")
+    elif message.get("voice"):
+        v = message["voice"]
+        kind, file_id, file_name, ctype = "voice", v["file_id"], "voice.ogg", v.get("mime_type") or "audio/ogg"
+        fsize = v.get("file_size")
+    elif message.get("animation"):
+        a = message["animation"]
+        kind, file_id, file_name, ctype = "animation", a["file_id"], a.get("file_name") or "animation.mp4", a.get("mime_type") or "video/mp4"
+        fsize = a.get("file_size")
+    if not file_id:
+        return None
+    if fsize and fsize > TG_FILE_MAX:
+        raise OverflowError(fsize)
+    info = tg_file_info(file_id)
+    if info.get("file_size") and info["file_size"] > TG_FILE_MAX:
+        raise OverflowError(info["file_size"])
+    data = tg_download_file(info["file_path"])
+    return (file_name or "file", ctype or "application/octet-stream", data)
+
+
 # ---------------- email: send ----------------
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -204,7 +261,7 @@ def gmail_api_send(msg):
         return json.loads(r.read())
 
 
-def send_email_to_agent(body_text, chat_id, sender_label):
+def send_email_to_agent(body_text, chat_id, sender_label, attachments=None):
     subject = subject_for_chat(chat_id)
     references = thread_refs(subject)
 
@@ -224,6 +281,10 @@ def send_email_to_agent(body_text, chat_id, sender_label):
         msg["In-Reply-To"] = references[-1]
         msg["References"] = " ".join(references[-10:])
     msg.set_content(body)
+    for att_name, att_ctype, att_data in (attachments or []):
+        maintype, _, subtype = (att_ctype or "application/octet-stream").partition("/")
+        msg.add_attachment(att_data, maintype=maintype or "application",
+                           subtype=subtype or "octet-stream", filename=att_name)
 
     if GOOGLE_REFRESH_TOKEN:
         gmail_api_send(msg)
@@ -394,12 +455,24 @@ def telegram_webhook():
     sender_label = sender.get("username") or sender.get("first_name") or str(chat_id)
 
     text = message.get("text")
-    if not text:
-        tg_send("כרגע אפשר לשלוח רק הודעות טקסט דרך הגשר.", chat_id=chat_id)
+    caption = message.get("caption") or ""
+    has_media = any(k in message for k in ("photo", "document", "video", "audio", "voice", "animation"))
+    if not text and not has_media:
+        tg_send("כרגע אפשר לשלוח טקסט, תמונות וקבצים דרך הגשר.", chat_id=chat_id)
         return jsonify(ok=True), 200
 
     try:
-        send_email_to_agent(text, chat_id, sender_label)
+        if has_media:
+            try:
+                att = extract_media(message)
+            except OverflowError as oe:
+                mb = round(int(oe.args[0]) / (1024 * 1024), 1) if oe.args else "?"
+                tg_send(f"📎 הקובץ גדול מדי להעברה דרך הגשר ({mb}MB, המגבלה 20MB).", chat_id=chat_id)
+                return jsonify(ok=True), 200
+            note = caption or ""
+            send_email_to_agent(note, chat_id, sender_label, attachments=[att])
+        else:
+            send_email_to_agent(text, chat_id, sender_label)
         tg_send("✅ נשלח", chat_id=chat_id)
     except Exception as e:
         log.error("failed to forward telegram message: %s", e)
@@ -479,9 +552,38 @@ def set_webhook():
     r = requests.post(f"{TG_API}/setWebhook", json={"url": url}, timeout=20)
     return jsonify(r.json()), (200 if r.ok else 500)
 
+def keep_alive():
+    """Render free sleeps after 15 min without inbound traffic; ping ourselves every 10 min.
+
+    RENDER_EXTERNAL_URL is set automatically by Render. The GitHub Actions cron
+    remains as the boot kicker for the first wake after a real sleep.
+    """
+    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not url:
+        log.info("keep-alive disabled (RENDER_EXTERNAL_URL not set)")
+        return
+    time.sleep(60)  # let the service finish booting first
+    while True:
+        try:
+            requests.get(url + "/health", timeout=15)
+        except Exception as e:
+            log.warning("keep-alive ping failed: %s", e)
+        time.sleep(600)
+
+
+# Telegram user-account content access (optional; active when TG_API_ID/TG_API_HASH are set)
+try:
+    import tgcontent
+    tgcontent.register(app)
+except Exception as e:
+    log.error("tgcontent module not loaded: %r", e)
+
 # Start the Gmail poller in the background (gunicorn runs this module once, one worker).
 _poller = threading.Thread(target=poll_agent_replies, daemon=True)
 _poller.start()
+
+_keepalive = threading.Thread(target=keep_alive, daemon=True)
+_keepalive.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
