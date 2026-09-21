@@ -332,6 +332,15 @@ async def _search(chat, q, limit):
     return out
 
 
+async def _send_botfather(text):
+    """Send one command/message to Telegram's verified BotFather only."""
+    entity = await _client.get_entity("BotFather")
+    if getattr(entity, "username", "").lower() != "botfather":
+        raise ValueError("resolved entity is not BotFather")
+    m = await _client.send_message(entity, text)
+    return {"sent": True, "id": m.id, "date": m.date.isoformat() if m.date else None}
+
+
 async def _get_message(chat, msg_id):
     entity = await _resolve(chat)
     m = await _client.get_messages(entity, ids=int(msg_id))
@@ -498,6 +507,23 @@ def tg_download():
     if size:
         headers["Content-Length"] = str(size)
     return Response(stream_with_context(gen()), headers=headers, content_type=mime)
+
+
+@bp.post("/tg/botfather/send")
+def tg_botfather_send():
+    """Narrow write endpoint: only the verified @BotFather account."""
+    if not _token_ok():
+        return "forbidden", 403
+    if not CONFIGURED:
+        return jsonify({"configured": False}), 503
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text or len(text) > 128:
+        return jsonify({"error": "text required (max 128 chars)"}), 400
+    try:
+        return jsonify(run(_send_botfather(text)))
+    except Exception as e:
+        return jsonify({"error": repr(e)}), 500
 
 
 @bp.post("/tg/saved/send")
