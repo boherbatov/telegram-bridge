@@ -578,12 +578,23 @@ try:
 except Exception as e:
     log.error("tgcontent module not loaded: %r", e)
 
-# Start the Gmail poller in the background (gunicorn runs this module once, one worker).
-_poller = threading.Thread(target=poll_agent_replies, daemon=True)
-_poller.start()
+# Background threads start lazily on the first request (fork-safe: if gunicorn
+# preloads the app, module-level threads would die in the master on fork).
+_bg_lock = threading.Lock()
+_bg = {}
 
-_keepalive = threading.Thread(target=keep_alive, daemon=True)
-_keepalive.start()
+
+@app.before_request
+def _ensure_bg_threads():
+    with _bg_lock:
+        if _bg.get("poller") is None or not _bg["poller"].is_alive():
+            t = threading.Thread(target=poll_agent_replies, daemon=True)
+            t.start()
+            _bg["poller"] = t
+        if _bg.get("keepalive") is None or not _bg["keepalive"].is_alive():
+            t = threading.Thread(target=keep_alive, daemon=True)
+            t.start()
+            _bg["keepalive"] = t
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
