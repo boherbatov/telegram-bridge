@@ -306,22 +306,36 @@ def tg_download():
     async def pump():
         try:
             async for chunk in _client.iter_download(m.media, chunk_size=256 * 1024):
-                chunks.put(chunk)
-        except Exception as e:
-            chunks.put(e)
-        finally:
-            chunks.put(None)
+                # bounded put: if the client went away, abort instead of
+                # freezing the whole event loop on a full queue
+                chunks.put(chunk, timeout=30)
+        except BaseException as e:
+            try:
+                chunks.put(e, timeout=5)
+            except Exception:
+                pass
+        try:
+            chunks.put(None, timeout=5)
+        except Exception:
+            pass
 
     def gen():
-        asyncio.run_coroutine_threadsafe(pump(), _loop)
-        while True:
-            item = chunks.get()
-            if item is None:
-                break
-            if isinstance(item, Exception):
-                log.error("tg download pump failed: %r", item)
-                break
-            yield item
+        fut = asyncio.run_coroutine_threadsafe(pump(), _loop)
+        try:
+            while True:
+                try:
+                    item = chunks.get(timeout=600)
+                except queue.Empty:
+                    log.error("tg download stalled; aborting stream")
+                    break
+                if item is None:
+                    break
+                if isinstance(item, BaseException):
+                    log.error("tg download pump failed: %r", item)
+                    break
+                yield item
+        finally:
+            fut.cancel()
 
     headers = {
         "Content-Disposition": "attachment; filename*=UTF-8''%s" % urllib.parse.quote(filename),
