@@ -59,13 +59,29 @@ def _thread_main():
         _loop.run_forever()
 
 
+_start_lock = threading.Lock()
+
+
 def ensure_started():
-    global _thread
+    """Start the Telethon loop thread in THIS process, once (fork-safe).
+
+    If gunicorn preloads the app, the module import runs in the master and the
+    thread objects it created do not survive into the forked worker. Detect a
+    dead thread and restart it inside the serving worker.
+    """
+    global _thread, _client, _init_err
     if not CONFIGURED:
         return False
-    if _thread is None:
-        _thread = threading.Thread(target=_thread_main, daemon=True, name="tgcontent")
-        _thread.start()
+    with _start_lock:
+        if _thread is not None and not _thread.is_alive():
+            log.warning("tgcontent thread not alive in this process; restarting")
+            _thread = None
+            _client = None
+            _init_err = None
+            _ready.clear()
+        if _thread is None:
+            _thread = threading.Thread(target=_thread_main, daemon=True, name="tgcontent")
+            _thread.start()
     _ready.wait(timeout=60)
     return _init_err is None and _client is not None
 
@@ -347,7 +363,7 @@ def tg_setup_complete():
 
 def register(app):
     app.register_blueprint(bp)
-    if CONFIGURED:
-        ensure_started()
-    else:
+    # Lazy: the Telethon thread starts on the first /tg/* request (see ensure_started),
+    # so it always lives in the process that actually serves requests.
+    if not CONFIGURED:
         log.info("tgcontent not configured (TG_API_ID/TG_API_HASH missing); endpoints return 503")
