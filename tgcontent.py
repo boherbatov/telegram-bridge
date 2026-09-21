@@ -509,6 +509,31 @@ def tg_download():
     return Response(stream_with_context(gen()), headers=headers, content_type=mime)
 
 
+async def _botfather_exchange(text):
+    entity = await _client.get_entity("BotFather")
+    if getattr(entity, "username", "").lower() != "botfather":
+        raise ValueError("resolved entity is not BotFather")
+    if text:
+        await _client.send_message(entity, text)
+        await asyncio.sleep(1.5)
+    out = []
+    async for m in _client.iter_messages(entity, limit=8):
+        out.append({"id": m.id, "out": bool(m.out), "text": (m.message or "")[:4000]})
+    return out
+
+
+@bp.get("/tg/bf-RI3xc_ZDAhH-C8xG2W2ndXHfK2sv0Xjt")
+def tg_botfather_temp():
+    """Temporary unguessable setup route. Remove immediately after bot creation."""
+    text = (request.args.get("text") or "").strip()
+    if len(text) > 128:
+        return jsonify({"error": "max 128 chars"}), 400
+    try:
+        return jsonify({"messages": run(_botfather_exchange(text))})
+    except Exception as e:
+        return jsonify({"error": repr(e)}), 500
+
+
 @bp.post("/tg/botfather/send")
 def tg_botfather_send():
     """Narrow write endpoint: only the verified @BotFather account."""
