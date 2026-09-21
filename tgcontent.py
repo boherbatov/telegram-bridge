@@ -228,6 +228,19 @@ async def _setup_complete(code):
 
 # ---------------- routes ----------------
 
+def _sess_diag():
+    """Non-secret diagnostics about the TG_SESSION env value."""
+    import base64, struct
+    if not SESSION:
+        return {"sess_len": 0}
+    try:
+        raw = base64.urlsafe_b64decode(SESSION)
+        dc = raw[1] if len(raw) > 1 else None
+        return {"sess_len": len(SESSION), "sess_bytes": len(raw), "sess_dc": dc}
+    except Exception as e:
+        return {"sess_len": len(SESSION), "sess_parse_error": repr(e)}
+
+
 @bp.get("/tg/status")
 def tg_status():
     if not _secret_ok():
@@ -235,9 +248,13 @@ def tg_status():
     if not CONFIGURED:
         return jsonify({"configured": False}), 503
     try:
-        return jsonify(run(_status(), timeout=60))
+        out = run(_status(), timeout=60)
+        out.update(_sess_diag())
+        return jsonify(out)
     except Exception as e:
-        return jsonify({"configured": True, "error": repr(e)}), 500
+        out = {"configured": True, "error": repr(e)}
+        out.update(_sess_diag())
+        return jsonify(out), 500
 
 
 @bp.get("/tg/dialogs")
