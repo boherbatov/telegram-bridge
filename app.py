@@ -98,10 +98,14 @@ def add_thread_ref(subject, msg_id):
 # ---------------- threading helpers ----------------
 
 def is_owner_chat(chat_id):
+    if str(chat_id) == "saved":
+        return True  # Saved Messages: the owner talking to himself
     return bool(TELEGRAM_CHAT_ID) and str(chat_id) == str(TELEGRAM_CHAT_ID)
 
 def subject_for_chat(chat_id):
     """The owner shares one clean thread; every other chat gets its own subject."""
+    if str(chat_id) == "saved":
+        return f"{SUBJECT} (saved)"
     if is_owner_chat(chat_id):
         return SUBJECT
     return f"{SUBJECT} (chat {chat_id})"
@@ -111,6 +115,8 @@ def chat_for_subject(subject):
     m = re.search(r"\(chat (-?\d+)\)", subject or "")
     if m:
         return m.group(1)
+    if "(saved)" in (subject or ""):
+        return "saved"
     return TELEGRAM_CHAT_ID or None
 
 # ---------------- telegram ----------------
@@ -405,7 +411,17 @@ def poll_agent_replies():
                             base_subject = re.sub(r"^(Re:\s*)+", "", subject).strip()
                             target_chat = chat_for_subject(base_subject)
                             atts = _extract_attachments(msg)
-                            if target_chat and (body or atts):
+                            if str(target_chat) == "saved" and (body or atts):
+                                tgc = globals().get("tgcontent")
+                                if tgc is None:
+                                    log.error("saved reply dropped: tgcontent module unavailable")
+                                else:
+                                    try:
+                                        tgc.send_to_saved(body, atts)
+                                        log.info("posted agent reply into Saved Messages (%d chars, %d atts)", len(body), len(atts or []))
+                                    except Exception as e:
+                                        log.error("saved-messages reply failed: %s", e)
+                            elif target_chat and (body or atts):
                                 notes = []
                                 if atts:
                                     if body and len(body) <= 1024:
@@ -575,6 +591,8 @@ def keep_alive():
 try:
     import tgcontent
     tgcontent.register(app)
+    tgcontent.set_saved_deliver(
+        lambda text, atts=None: send_email_to_agent(text, "saved", "saved", attachments=atts))
 except Exception as e:
     log.error("tgcontent module not loaded: %r", e)
 
@@ -595,6 +613,12 @@ def _ensure_bg_threads():
             t = threading.Thread(target=keep_alive, daemon=True)
             t.start()
             _bg["keepalive"] = t
+        tgc = globals().get("tgcontent")
+        if tgc is not None and getattr(tgc, "CONFIGURED", False) and not _bg.get("tgcontent_ok"):
+            try:
+                _bg["tgcontent_ok"] = bool(tgc.ensure_started())
+            except Exception as e:
+                log.error("tgcontent start failed: %r", e)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
