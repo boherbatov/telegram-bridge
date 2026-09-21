@@ -12,6 +12,7 @@ All configuration comes from environment variables (see README.md).
 """
 
 import imaplib
+import io
 import json
 import logging
 import socket as _socket
@@ -58,6 +59,12 @@ STATE_FILE = os.environ.get("STATE_FILE", "bridge_state.json")
 SUBJECT = os.environ.get("SUBJECT", "Telegram Bridge")
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+AI_BOT_TOKEN = os.environ.get("AI_BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+AI_TG_API = f"https://api.telegram.org/bot{AI_BOT_TOKEN}" if AI_BOT_TOKEN else ""
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+
 
 # ---------------- state ----------------
 
@@ -450,6 +457,122 @@ def poll_agent_replies():
             log.error("gmail poll error: %s", e)
         time.sleep(POLL_INTERVAL)
 
+# ---------------- standalone fast AI bot ----------------
+
+_ai_rate = {}
+_ai_rate_lock = threading.Lock()
+
+
+def _ai_allowed(chat_id):
+    """Per-chat anti-abuse limit: 12 requests/minute and 120/day."""
+    now = time.time()
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    with _ai_rate_lock:
+        row = _ai_rate.setdefault(str(chat_id), {"times": [], "day": day, "daily": 0})
+        if row["day"] != day:
+            row.update(day=day, daily=0, times=[])
+        row["times"] = [x for x in row["times"] if now - x < 60]
+        if len(row["times"]) >= 12 or row["daily"] >= 120:
+            return False
+        row["times"].append(now)
+        row["daily"] += 1
+        return True
+
+
+def _ai_send(method, payload=None, files=None):
+    r = requests.post(f"{AI_TG_API}/{method}", data=payload if files else None,
+                      json=None if files else payload, files=files, timeout=90)
+    if not r.ok:
+        log.error("AI telegram %s failed: %s %s", method, r.status_code, r.text[:300])
+    return r
+
+
+def _ai_send_text(chat_id, text):
+    text = (text or "לא הצלחתי ליצור תשובה.").strip()
+    for i in range(0, len(text), 4000):
+        _ai_send("sendMessage", {"chat_id": str(chat_id), "text": text[i:i+4000]})
+
+
+def _gemini(parts, model=None, response_modalities=None):
+    model = model or GEMINI_MODEL
+    body = {"contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {"temperature": 0.35, "maxOutputTokens": 2048}}
+    if response_modalities:
+        body["generationConfig"]["responseModalities"] = response_modalities
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    r = requests.post(url, params={"key": GEMINI_API_KEY}, json=body, timeout=120)
+    if not r.ok:
+        raise RuntimeError(f"Gemini {r.status_code}: {r.text[:500]}")
+    return r.json()
+
+
+def _gemini_text(prompt, image=None):
+    parts = [{"text": ("ענה בעברית, מהר ובקצרה אלא אם ביקשו פירוט. " + prompt)}]
+    if image:
+        mime, data = image
+        parts.insert(0, {"inline_data": {"mime_type": mime,
+                                        "data": base64.b64encode(data).decode()}})
+    j = _gemini(parts)
+    return "\n".join(p.get("text", "") for c in j.get("candidates", [])
+                      for p in c.get("content", {}).get("parts", []) if p.get("text")).strip()
+
+
+def _gemini_image(prompt):
+    j = _gemini([{"text": prompt}], model=GEMINI_IMAGE_MODEL,
+                response_modalities=["TEXT", "IMAGE"])
+    texts, image = [], None
+    for c in j.get("candidates", []):
+        for p in c.get("content", {}).get("parts", []):
+            if p.get("text"):
+                texts.append(p["text"])
+            blob = p.get("inlineData") or p.get("inline_data")
+            if blob and blob.get("data"):
+                image = (blob.get("mimeType") or blob.get("mime_type") or "image/png",
+                         base64.b64decode(blob["data"]))
+    return "\n".join(texts).strip(), image
+
+
+def _ai_download_photo(message):
+    photo = (message.get("photo") or [])[-1]
+    info = requests.get(f"{AI_TG_API}/getFile", params={"file_id": photo["file_id"]}, timeout=20).json()
+    path = info["result"]["file_path"]
+    data = requests.get(f"https://api.telegram.org/file/bot{AI_BOT_TOKEN}/{path}", timeout=60).content
+    return "image/jpeg", data
+
+
+def _process_ai_update(update):
+    message = update.get("message") or update.get("edited_message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    if not chat_id:
+        return
+    if not _ai_allowed(chat_id):
+        _ai_send_text(chat_id, "יותר מדי בקשות כרגע. נסה שוב בעוד דקה.")
+        return
+    text = (message.get("text") or message.get("caption") or "").strip()
+    try:
+        if text in ("/start", "/help"):
+            _ai_send_text(chat_id, "שלום! אני בוט AI מהיר. שלח שאלה או תמונה. ליצירת תמונה כתוב: צייר: ואז תיאור.")
+            return
+        if text.startswith(("צייר:", "/image ", "תיצור תמונה:")):
+            prompt = text.split(":", 1)[-1].strip() if ":" in text else text[7:].strip()
+            _ai_send("sendChatAction", {"chat_id": str(chat_id), "action": "upload_photo"})
+            caption, image = _gemini_image(prompt)
+            if not image:
+                raise RuntimeError("Gemini image model returned no image")
+            _ai_send("sendPhoto", {"chat_id": str(chat_id), "caption": caption[:900]},
+                     files={"photo": ("image.png", image[1], image[0])})
+            return
+        _ai_send("sendChatAction", {"chat_id": str(chat_id), "action": "typing"})
+        image = _ai_download_photo(message) if message.get("photo") else None
+        prompt = text or "תאר את התמונה והסבר מה רואים בה."
+        _ai_send_text(chat_id, _gemini_text(prompt, image=image))
+    except Exception as e:
+        log.error("AI bot error: %s", e)
+        if "429" in str(e) and "image" in str(e).lower():
+            _ai_send_text(chat_id, "יצירת תמונות לא זמינה כרגע במכסה החינמית. שאלות והבנת תמונות ממשיכות לעבוד.")
+        else:
+            _ai_send_text(chat_id, "לא הצלחתי לענות כרגע. נסה שוב בעוד רגע.")
+
 # ---------------- flask app ----------------
 
 app = Flask(__name__)
@@ -457,6 +580,13 @@ app = Flask(__name__)
 @app.get("/health")
 def health():
     return "ok", 200
+
+@app.post("/ai-webhook")
+def ai_telegram_webhook():
+    update = request.get_json(silent=True) or {}
+    threading.Thread(target=_process_ai_update, args=(update,), daemon=True).start()
+    return jsonify(ok=True), 200
+
 
 @app.post("/webhook")
 def telegram_webhook():
@@ -559,6 +689,17 @@ def selftest():
 
     healthy = all(str(v).startswith("ok") for v in result.values())
     return jsonify(result), (200 if healthy else 500)
+
+@app.get("/set-ai-webhook")
+def set_ai_webhook():
+    if not WEBHOOK_SECRET or request.args.get("secret") != WEBHOOK_SECRET:
+        return "forbidden", 403
+    if not AI_BOT_TOKEN or not GEMINI_API_KEY:
+        return jsonify({"ok": False, "error": "AI bot not configured"}), 503
+    url = request.url_root.replace("http://", "https://") + "ai-webhook"
+    r = requests.post(f"{AI_TG_API}/setWebhook", json={"url": url}, timeout=20)
+    return jsonify(r.json()), (200 if r.ok else 500)
+
 
 @app.get("/set-webhook")
 def set_webhook():
