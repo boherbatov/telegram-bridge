@@ -79,7 +79,8 @@ def run(coro, timeout=120):
 
 
 def _secret_ok():
-    return bool(WEBHOOK_SECRET) and request.args.get("secret") == WEBHOOK_SECRET
+    s = request.args.get("secret", "")
+    return (WEBHOOK_SECRET and s == WEBHOOK_SECRET) or (SETUP_TOKEN and s == SETUP_TOKEN)
 
 
 def _token_ok():
