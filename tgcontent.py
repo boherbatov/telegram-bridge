@@ -350,7 +350,7 @@ def tg_download():
                 if isinstance(item, BaseException):
                     log.error("tg download pump failed: %r", item)
                     break
-                yield item
+                yield bytes(item)  # telethon yields memoryview; WSGI needs bytes
         finally:
             fut.cancel()
 
