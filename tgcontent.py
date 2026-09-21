@@ -5,6 +5,11 @@ Optional: active only when TG_API_ID / TG_API_HASH are set. With a StringSession
 in TG_SESSION it is fully authorized; without one, the /tg/setup/* flow creates
 a session (the owner approves a login code in his own Telegram app once).
 
+Also hosts the Saved Messages watcher: messages the owner writes in his own
+Saved Messages (chat "me") are forwarded to the agent by email, and the agent's
+email replies are posted back into Saved Messages as his account. The watcher
+never writes to any other chat.
+
 Security:
   - data endpoints  -> require WEBHOOK_SECRET as ?secret=
   - setup endpoints -> require TG_SETUP_TOKEN as ?token=
@@ -37,7 +42,22 @@ _ready = threading.Event()
 _init_err = None
 _pending = {}  # setup flow: phone + phone_code_hash
 
+# ---------------- saved-messages watcher state ----------------
+
+SM_REPLY_PREFIX = "🤖 "          # prefix on answers we post; loop backstop across restarts
+SM_MEDIA_MAX = 20 * 1024 * 1024  # attachments above this are noted, not emailed
+
+_me_id = None
+_deliver_fn = None   # set by app.py: fn(body_text, attachments) -> email to agent
+_sent_ids = set()    # ids of messages we posted into Saved Messages this run
+
 bp = Blueprint("tgcontent", __name__)
+
+
+def set_saved_deliver(fn):
+    """app.py hands over its send_email_to_agent wrapper (avoids a circular import)."""
+    global _deliver_fn
+    _deliver_fn = fn
 
 
 def _thread_main():
@@ -50,6 +70,10 @@ def _thread_main():
         _client = TelegramClient(StringSession(SESSION or None), int(API_ID), API_HASH, loop=_loop)
         _loop.run_until_complete(_client.connect())
         log.info("tgcontent telethon client connected (session %s)", "present" if SESSION else "empty")
+        try:
+            _loop.run_until_complete(_watch_setup())
+        except Exception as e:
+            log.error("saved watcher setup failed: %r", e)
     except Exception as e:  # keep the bridge alive even if telethon fails
         _init_err = e
         log.error("tgcontent init failed: %r", e)
@@ -106,6 +130,8 @@ def _token_ok():
 async def _resolve(chat):
     """Resolve a channel/group/user by id, rebuilding the entity cache if needed."""
     from telethon.utils import get_peer_id
+    if str(chat).lower() in ("me", "self", "saved"):
+        return "me"  # Saved Messages; telethon accepts the literal
     cid = int(chat)
     try:
         return await _client.get_entity(cid)
@@ -123,6 +149,114 @@ async def _resolve(chat):
     raise ValueError("chat %s not found among dialogs" % chat)
 
 
+# ---------------- saved-messages watcher ----------------
+
+def _register_watcher():
+    """Attach the Saved Messages NewMessage handler to the live client (once per client)."""
+    if _client is None or getattr(_client, "_saved_watcher_on", False):
+        return
+    from telethon import events
+
+    @_client.on(events.NewMessage())
+    async def _on_new_message(event):
+        try:
+            if _me_id is None or event.chat_id != _me_id:
+                return  # not Saved Messages
+            m = event.message
+            if m is None or not m.out:
+                return
+            if m.id in _sent_ids:
+                return  # posted by us this run
+            if (m.message or "").startswith(SM_REPLY_PREFIX):
+                return  # posted by us before a restart
+            if getattr(m, "action", None) is not None:
+                return  # service message
+            await _handle_saved_message(m)
+        except Exception as e:
+            log.error("saved watcher handler error: %r", e)
+
+    _client._saved_watcher_on = True
+    log.info("saved-messages watcher registered (me=%s)", _me_id)
+
+
+async def _watch_setup():
+    """After connect: if authorized, resolve self and arm the watcher + catch up missed updates."""
+    global _me_id
+    if not await _client.is_user_authorized():
+        log.info("saved watcher: client not authorized yet; will register after setup completes")
+        return
+    me = await _client.get_me()
+    _me_id = me.id
+    _register_watcher()
+    try:
+        await _client.catch_up()  # replay questions written while the service was down
+    except Exception as e:
+        log.warning("saved watcher catch_up failed: %r", e)
+
+
+async def _handle_saved_message(m):
+    text = (m.message or "").strip()
+    notes, atts = [], []
+    if m.media is not None:
+        f = m.file
+        if f is None:
+            notes.append("[מדיה מסוג שאינו נתמך]")
+        elif f.size and f.size > SM_MEDIA_MAX:
+            notes.append("[קובץ מצורף גדול מדי להעברה: %s (%.1fMB)]" % (f.name or "media", f.size / 1048576))
+        else:
+            try:
+                data = await _client.download_media(m, file=bytes)
+                if data:
+                    atts.append((f.name or "file", f.mime_type or "application/octet-stream", data))
+            except Exception as e:
+                log.error("saved media download failed (msg %s): %r", m.id, e)
+                notes.append("[הורדת הקובץ המצורף נכשלה]")
+    body = "\n".join(x for x in [text] + notes if x).strip()
+    if not body and not atts:
+        return
+    deliver = _deliver_fn
+    if deliver is None:
+        log.error("saved watcher: no deliver function set; dropping message %s", m.id)
+        return
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, deliver, body, atts)
+        log.info("saved question msg=%s forwarded to agent (%d chars, %d atts)", m.id, len(body), len(atts))
+    except Exception as e:
+        log.error("saved question msg=%s email failed: %r", m.id, e)
+
+
+async def _send_saved_async(body, atts, mark=True):
+    """Send text chunks and attachments into Saved Messages ('me')."""
+    import io
+    ids = []
+    MAX = 3800
+    chunks = [body[i:i + MAX] for i in range(0, len(body), MAX)] if body else []
+    for chunk in chunks:
+        msg = await _client.send_message("me", (SM_REPLY_PREFIX + chunk) if mark else chunk)
+        ids.append(msg.id)
+    for i, (fname, ctype, data) in enumerate(atts or []):
+        bio = io.BytesIO(data)
+        bio.name = fname or "file"
+        caption = None
+        if mark and not chunks and i == 0:
+            caption = SM_REPLY_PREFIX.strip()  # file-only reply still carries the loop marker
+        try:
+            msg = await _client.send_file("me", bio, caption=caption)
+            ids.append(msg.id)
+        except Exception as e:
+            log.error("saved attachment send failed (%s): %r", fname, e)
+    if mark:
+        _sent_ids.update(ids)
+        while len(_sent_ids) > 500:
+            _sent_ids.pop()
+    return ids
+
+
+def send_to_saved(body, atts=None):
+    """Post the agent's reply into the owner's Saved Messages, as his account."""
+    return run(_send_saved_async(body or "", atts, mark=True))
+
+
 # ---------------- async workers ----------------
 
 async def _status():
@@ -137,6 +271,7 @@ async def _status():
                 "name": " ".join(x for x in [me.first_name, me.last_name] if x),
                 "username": getattr(me, "username", None),
             }
+            out["saved_watcher"] = bool(getattr(_client, "_saved_watcher_on", False))
     except Exception as e:
         out["error"] = repr(e)
     return out
@@ -153,7 +288,7 @@ async def _dialogs(limit):
         elif d.is_channel:
             kind = "supergroup"
         out.append({
-            "id": getattr(ent, "id", d.id),
+            "id": getattr(ent, "id", None) or d.id,
             "peer_id": get_peer_id(ent),
             "title": d.title or d.name or "",
             "type": kind,
@@ -213,6 +348,7 @@ async def _setup_start(phone):
 
 
 async def _setup_complete(code):
+    global _me_id
     code = re.sub(r"[\s\-]", "", code or "")
     try:
         await _client.sign_in(_pending["phone"], code, phone_code_hash=_pending["hash"])
@@ -223,6 +359,8 @@ async def _setup_complete(code):
         raise
     session_string = _client.session.save()
     me = await _client.get_me()
+    _me_id = me.id
+    _register_watcher()
     return {"authorized": True, "session": session_string, "user_id": me.id}
 
 
@@ -362,6 +500,27 @@ def tg_download():
     return Response(stream_with_context(gen()), headers=headers, content_type=mime)
 
 
+@bp.post("/tg/saved/send")
+def tg_saved_send():
+    """Post a raw text message into the owner's Saved Messages (verification/tests).
+
+    Hardcoded to chat 'me' - this endpoint cannot write to any other chat.
+    """
+    if not _token_ok():
+        return "forbidden", 403
+    if not CONFIGURED:
+        return jsonify({"configured": False}), 503
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or request.args.get("text", "")).strip()
+    if not text:
+        return jsonify({"error": "text required"}), 400
+    try:
+        ids = run(_send_saved_async(text, None, mark=False))
+        return jsonify({"sent": True, "ids": ids})
+    except Exception as e:
+        return jsonify({"error": repr(e)}), 500
+
+
 @bp.post("/tg/setup/start")
 def tg_setup_start():
     if not _token_ok():
@@ -395,6 +554,7 @@ def tg_setup_complete():
 def register(app):
     app.register_blueprint(bp)
     # Lazy: the Telethon thread starts on the first /tg/* request (see ensure_started),
-    # so it always lives in the process that actually serves requests.
+    # so it always lives in the process that actually serves requests. app.py also
+    # calls ensure_started() on boot so the Saved Messages watcher stays live.
     if not CONFIGURED:
         log.info("tgcontent not configured (TG_API_ID/TG_API_HASH missing); endpoints return 503")
