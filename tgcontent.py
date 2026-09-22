@@ -332,6 +332,32 @@ async def _search(chat, q, limit):
     return out
 
 
+async def _video_items(chat, limit, only_id=None):
+    entity = await _resolve(chat)
+    messages = [await _client.get_messages(entity, ids=int(only_id))] if only_id else []
+    if not only_id:
+        async for m in _client.iter_messages(entity, limit=limit):
+            messages.append(m)
+    out = []
+    for m in messages:
+        if m is None or m.media is None or m.file is None:
+            continue
+        mime = (m.file.mime_type or "").lower()
+        if not (mime.startswith("video/") or getattr(m.file, "duration", None)):
+            continue
+        text = (m.message or "").strip()
+        title = re.split(r"[\n.!?]", text, 1)[0][:140] or (m.file.name or "Telegram video")
+        out.append({
+            "id": "tg-%s-%s" % (str(chat).replace("@", ""), m.id),
+            "type": "telegram", "title": title, "description": text,
+            "telegram_channel": str(chat).replace("@", ""), "telegram_message_id": m.id,
+            "source_url": "https://t.me/%s/%s" % (str(chat).replace("@", ""), m.id),
+            "published_at": m.date.isoformat() if m.date else None,
+            "duration_seconds": getattr(m.file, "duration", None),
+            "file_size": m.file.size, "mime_type": mime,
+        })
+    return out
+
 async def _send_botfather(text):
     """Send one command/message to Telegram's verified BotFather only."""
     entity = await _client.get_entity("BotFather")
@@ -446,6 +472,36 @@ def tg_search():
     except Exception as e:
         return jsonify({"error": repr(e)}), 500
 
+
+
+@bp.get("/tg/videos")
+def tg_videos():
+    if not _secret_ok(): return "forbidden", 403
+    chat = request.args.get("chat", "")
+    limit = min(int(request.args.get("limit", "50")), 100)
+    try: return jsonify({"items": run(_video_items(chat, limit))})
+    except Exception as e: return jsonify({"error": repr(e)}), 500
+
+@bp.get("/tg/post")
+def tg_post():
+    if not _secret_ok(): return "forbidden", 403
+    chat, msg = request.args.get("chat", ""), request.args.get("msg", "")
+    try:
+        items = run(_video_items(chat, 1, msg))
+        if not items: return jsonify({"error": "message has no video"}), 404
+        return jsonify({"item": items[0]})
+    except Exception as e: return jsonify({"error": repr(e)}), 500
+
+@bp.get("/tg/thumb")
+def tg_thumb():
+    if not _secret_ok(): return "forbidden", 403
+    chat, msg = request.args.get("chat", ""), request.args.get("msg", "")
+    try:
+        m = run(_get_message(chat, msg))
+        data = run(_client.download_media(m, file=bytes, thumb=-1))
+        if not data: return "not found", 404
+        return Response(data, content_type="image/jpeg", headers={"Cache-Control":"public,max-age=86400"})
+    except Exception as e: return jsonify({"error": repr(e)}), 500
 
 @bp.get("/tg/download")
 def tg_download():
